@@ -18,6 +18,30 @@ final class H264Decoder: @unchecked Sendable {  // confined to `queue`
     var quality: Double = 0.75
     let queue = DispatchQueue(label: "video.decode")
 
+    private struct PendingFrame {
+        let image: CVImageBuffer
+        let decodeMs: Double
+        let unit: AccessUnit
+    }
+    private let output = LatestFrameOutput<PendingFrame>(interval: 0.2)
+
+    init() {
+        output.consume = { [weak self] pending in
+            guard let self, let frame = self.jpeg(pending.image, ms: pending.decodeMs, unit: pending.unit) else { return }
+            self.onFrame?(frame)
+        }
+    }
+
+    /// A snapshot must include the last decoded frame, even when its JPEG was waiting for the rate limit.
+    func flush() async {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                if let session = self.session { VTDecompressionSessionWaitForAsynchronousFrames(session) }
+                self.output.flush { continuation.resume() }
+            }
+        }
+    }
+
     private var sps: Data?, pps: Data?
     private var format: CMVideoFormatDescription?
     private var session: VTDecompressionSession?
@@ -84,7 +108,7 @@ final class H264Decoder: @unchecked Sendable {  // confined to `queue`
             }
             guard emit else { return }
             let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
-            if let frame = self.jpeg(image, ms: ms, unit: unit) { self.onFrame?(frame) }
+            self.output.offer(PendingFrame(image: image, decodeMs: ms, unit: unit))
         }
         return status
     }
@@ -150,5 +174,54 @@ final class H264Decoder: @unchecked Sendable {  // confined to `queue`
         CGImageDestinationAddImage(dest, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         return Frame(jpeg: out as Data, width: image.width, height: image.height, decodeMs: ms, unit: unit)
+    }
+}
+
+/// Decode every H.264 reference, but encode/publish at most five JPEGs per second. A catch-up burst
+/// keeps only its latest pixel buffer; the trailing frame is delivered even if the screen then stops.
+private final class LatestFrameOutput<Value>: @unchecked Sendable {
+    var consume: (Value) -> Void = { _ in }
+    private let interval: TimeInterval
+    private let queue = DispatchQueue(label: "video.jpeg")
+    private let lock = NSLock()
+    private var pending: Value?
+    private var scheduled = false
+    private var lastOutput = -Double.infinity  // confined to queue
+
+    init(interval: TimeInterval) { self.interval = interval }
+
+    func offer(_ value: Value) {
+        let start = lock.withLock {
+            pending = value
+            guard !scheduled else { return false }
+            scheduled = true
+            return true
+        }
+        if start { queue.async { self.work() } }
+    }
+
+    func flush(_ completion: @escaping () -> Void) {
+        queue.async {
+            self.deliver(forced: true)
+            completion()
+        }
+    }
+
+    private func work() {
+        let delay = lastOutput + interval - ProcessInfo.processInfo.systemUptime
+        if delay > 0 {
+            queue.asyncAfter(deadline: .now() + delay) { self.work() }
+        } else { deliver(forced: false) }
+    }
+
+    private func deliver(forced: Bool) {
+        let value = lock.withLock {
+            if !forced { scheduled = false }
+            defer { pending = nil }
+            return pending
+        }
+        guard let value else { return }
+        consume(value)
+        lastOutput = ProcessInfo.processInfo.systemUptime
     }
 }

@@ -141,7 +141,8 @@ extension ScreenSource {
     @discardableResult
     func currentFrame(maxAge: Double = 1, wait: Double = 3) async throws -> String {
         if streamOn && mirroring {
-            if frame != nil && now() - updated < maxAge { return "live" }
+            let frameAt = capturedAt > 0 ? capturedAt : updated
+            if frame != nil && now() - frameAt < maxAge { return "live" }
             if await fresh(since: now() - maxAge, timeout: wait) != nil { return "live (waited)" }
         }
         do {
@@ -163,7 +164,7 @@ extension ScreenSource {
         } else {
             try await device.send("snap")
         }
-        await withCheckedContinuation { c in decoder.queue.async { c.resume() } }  // the GOP is decoded
+        await decoder.flush()  // finish async decoding and publish the snapshot's last frame
         try? await Task.sleep(nanoseconds: 30_000_000)  // let the last frame reach the main queue
         let ms = (now() - started) * 1000
         metrics?.snapLatency(ms)

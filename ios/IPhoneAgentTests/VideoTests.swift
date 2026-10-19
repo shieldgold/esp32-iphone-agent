@@ -4,6 +4,7 @@ import XCTest
 /// `video` chunk reassembly (docs/ble-protocol.md).
 final class VideoTests: XCTestCase {
     typealias F = VideoAssembler.Flags
+    private static let decoderFrame = Data(base64Encoded: "AAAAAWdCwArcQmwEQAAAAwBAAAADAqPEieAAAAABaM4PyAAAAAFliIQ6EYoAAhjxwABA9jgACHlJycnXXXXXXXXXXXXg")!
 
     func chunk(_ seq: UInt16, _ flags: F, _ payload: [UInt8], ms: UInt32? = nil) -> Data {
         var d = Data([UInt8(seq & 0xff), UInt8(seq >> 8), flags.rawValue])
@@ -61,5 +62,66 @@ final class VideoTests: XCTestCase {
         let units = annexBUnits(Data(sps + [0, 0, 1, 0x68, 5] + idr))
         XCTAssertEqual(units.map { $0.first! & 0x1f }, [7, 8, 5])
         XCTAssertEqual(units[0], Data([0x67, 1, 2]))
+    }
+
+    func testDecoderCoalescesCatchUpFramesAndStillPublishesTheLastFrame() async {
+        // A real 64x64 red H.264 IDR with SPS/PPS (libx264 baseline). Replaying a GOP must
+        // decode its references without JPEG-encoding and publishing every historical frame.
+        let data = Self.decoderFrame
+        let decoder = H264Decoder()
+        let latest = expectation(description: "last frame survives a burst without another input")
+        let lock = NSLock()
+        var frames: [UInt32] = []
+        decoder.onFrame = { frame in
+            lock.withLock { frames.append(frame.unit.boardMs) }
+            if frame.unit.boardMs == 80 { latest.fulfill() }
+        }
+        decoder.onError = { XCTFail($0) }
+        decoder.queue.async {
+            for i in 1...80 {
+                decoder.decode(AccessUnit(data: data, idr: true, config: false, snap: false, boardMs: UInt32(i)))
+            }
+        }
+        await fulfillment(of: [latest], timeout: 3)
+        let emitted = lock.withLock { frames }
+        XCTAssertEqual(emitted.last, 80)
+        XCTAssertLessThanOrEqual(emitted.count, 8, "Catch-up frames must not all become JPEGs/UI updates")
+    }
+
+    func testSnapshotFlushIncludesTheLastRateLimitedFrame() async {
+        let decoder = H264Decoder()
+        let lock = NSLock()
+        var last: UInt32?
+        decoder.onFrame = { frame in lock.withLock { last = frame.unit.boardMs } }
+        decoder.onError = { XCTFail($0) }
+        decoder.queue.async {
+            decoder.decode(AccessUnit(data: Self.decoderFrame, idr: true, config: false, snap: true, boardMs: 1))
+        }
+        await decoder.flush()
+        XCTAssertEqual(lock.withLock { last }, 1)
+        decoder.queue.async {
+            for i in 2...80 {
+                decoder.decode(AccessUnit(data: Self.decoderFrame, idr: true, config: false, snap: true, boardMs: UInt32(i)))
+            }
+        }
+        await decoder.flush()
+        XCTAssertEqual(lock.withLock { last }, 80, "A snap must not return while its last frame is still pending")
+    }
+
+    @MainActor func testRecentlyReceivedHistoricalFrameIsNotTreatedAsLive() async throws {
+        let board = FakeBoard()
+        let device = CommandChannel(transport: board)
+        board.channel = device
+        device.linkUp()
+        let feed = VideoFeed()
+        feed.device = device
+        feed.mirroring = true
+        try await feed.stream(true)
+        feed.boardClock(ms: 60_000)
+        // show() publishes immediately, but its board timestamp is zero: the image is a minute old.
+        feed.show(Data([1]), width: 64, height: 64)
+        let source = try await feed.currentFrame(wait: 0)
+        XCTAssertEqual(source, "snap")
+        XCTAssertTrue(board.lines.contains { $0.hasSuffix(" snap") })
     }
 }
